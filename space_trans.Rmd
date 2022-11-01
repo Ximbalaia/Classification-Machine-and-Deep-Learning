@@ -1,0 +1,703 @@
+---
+title: "Classification Models"
+author: "João Victor"
+date: "2022-10-31"
+output: html_document
+---
+
+### Load the libraries
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(summarytools)
+library(RColorBrewer)
+library(gridExtra)
+library(e1071)
+library(caTools)
+library(caret)
+library(class)
+library(rpart)
+library(randomForest)
+library(h2o)
+library(xgboost)
+```
+
+### Load the data
+```{r}
+train = read.csv('train.csv' ,na.strings = c("", "NA"))
+test = read.csv('test.csv', na.strings = c("", "NA"))
+test_values = read.csv('sample_submission.csv')
+test$Transported = NA
+```
+
+### Data Description
+
+##### **PassengerId**
+A unique id for each passenger, Each id takes the form gggg_pp where gggg indicates a group the passenger is travelling with and pp is the number within the group. People in a group are often family members, but no always.  
+
+##### **HomePlanet**
+The planet the passenger departed from, typically their planet of permanent residence.  
+
+##### **CryoSleep**
+Indicates whether the passenger elected to be put into suspended animation for the duration of the voyage. Passengers in cryosleep are confined to their cabins.  
+
+##### **Cabin**
+The cabin number where the passenger is staying. Takes the form deck/num/side, where side can be either P for Port or S for Starboard.  
+
+##### **Destination**
+The planet the passenger will be debarking to.  
+
+##### **Age**
+The age of the passenger.  
+
+##### **VIP**
+Whether the passenger has paid for special VIP service during the voyage.
+
+##### **RoomService, FoodCourt, ShoppingMall, Spa, VRDeck**
+Amount the passenger has billed at each of the Spaceship Titanic's many luxury amenities.
+
+##### **Name**
+The first and last names of the passenger.
+
+##### **Transported**
+Whether the passenger was transported to another dimension. This is the target, the column you are trying to predict.  
+
+- I'll merge the two datasets to make the cleaning and data preprocessing in both at the same time.
+```{r}
+merged = rbind(train, test)
+```
+
+First we need to know the number of missing values.
+```{r}
+NAcol = colnames(merged)[colSums(is.na(merged))>0]
+sort(colSums(sapply(merged[NAcol], is.na)), decreasing = T)
+```
+
+### Fix it
+**CryoSleep**
+```{r}
+merged$CryoSleep[is.na(merged$CryoSleep)] = names(sort(-table(merged$CryoSleep))) [1]
+```
+
+**ShoppingMall**
+```{r}
+merged$ShoppingMall[is.na(merged$ShoppingMall)] = median(merged$ShoppingMall, na.rm = T)
+```
+
+**Cabin**  
+When we analyze the Cabin column, it's difficult not to drop the variable, but if we check the description of this variable we can see that the first letter means the deck of this passenger, and the last letter means what is the side of the cabin (Port - left, Starboard - right). I'll then, create two new variables called CabinDeck and CabinSide, before handle the missing values.
+```{r}
+CabinDeck = merged$Cabin %>% str_replace("/.*", "")
+merged$CabinDeck = CabinDeck
+
+CabinSide = merged$Cabin %>% str_replace(".*/", "")
+merged$CabinSide = CabinSide
+```
+
+**CabinDeck**
+```{r}
+merged$CabinDeck[is.na(merged$CabinDeck)] = median(merged$CabinDeck, na.rm = T)
+```
+
+**CabinSide**
+```{r}
+merged$CabinSide[is.na(merged$CabinSide)] = median(merged$CabinSide, na.rm = T)
+```
+
+**CabinShared**
+I'll also create a variable called CabinShared for duplicated Cabin values (including deck/num/side). I could also create a variable for family members based on surname. I actually created but was too similar of CabinShared, so i decided to drop.
+```{r}
+merged$CabinShared = merged$Cabin %in% unique(merged$Cabin[duplicated(merged$Cabin, incomparables = NA)])
+```
+
+We don't need the Cabin columns anymore, so it's time to drop it.
+```{r}
+merged$Cabin = NULL
+merged$Name = NULL
+```
+
+**VIP**
+```{r}
+merged$VIP[is.na(merged$VIP)] = names(sort(-table(merged$VIP))) [1]
+```
+
+**FoodCourt**
+```{r}
+merged$FoodCourt[is.na(merged$FoodCourt)] = median(merged$FoodCourt, na.rm = T)
+```
+
+**HomePlanet**
+```{r}
+merged$HomePlanet[is.na(merged$HomePlanet)] = names(sort(-table(merged$HomePlanet))) [1]
+```
+
+**Spa**
+```{r}
+merged$Spa[is.na(merged$Spa)] = median(merged$Spa, na.rm = T)
+```
+
+**Destination**
+```{r}
+merged$Destination[is.na(merged$Destination)] = names(sort(-table(merged$Destination))) [1]
+```
+
+**Age**
+```{r}
+set.seed(1)
+merged$Age[is.na(merged$Age)] = round(runif(sum(is.na(merged$Age)), min = 0, max = 79),0)
+```
+
+**VRDeck**
+```{r}
+merged$VRDeck[is.na(merged$VRDeck)] = median(merged$VRDeck, na.rm = T)
+```
+
+**RoomService**
+```{r}
+merged$RoomService[is.na(merged$RoomService)] = median(merged$RoomService, na.rm = T)
+```
+
+Check NA values again.
+```{r}
+NAcol = colnames(merged)[colSums(is.na(merged))>0]
+sort(colSums(sapply(merged[NAcol], is.na)), decreasing = T)
+```
+Only Transported column still have NA values, so the data is almost ready.
+
+### EDA
+```{r}
+train_x = merged[1:8693, ]
+test_x = merged[8694:12970, ]
+```
+
+```{r}
+my_colors <- RColorBrewer::brewer.pal(4, "Set1")[2:4]
+```
+
+**HomePlanet**
+```{r}
+ggplot(train_x, aes(HomePlanet, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - HomePlanet (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.')
+```
+
+**CryoSleep**
+```{r}
+ggplot(train_x, aes(CryoSleep, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - CryoSleep (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.')
+```
+
+We can see that most of the passengers who chose the CryoSleep didn't survived. Trying to use the logic here, maybe this happened because if they were asleep, they couldn't run or do whatever it was possible to avoid the Transport.
+
+**Destination**
+```{r}
+ggplot(train_x, aes(Destination, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - Destination (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.')
+```
+
+**Age**
+```{r}
+TransportedF = train_x %>% filter(Transported == 'False')
+TransportedT = train_x %>% filter(Transported == 'True')
+
+TplotT = ggplot(TransportedT, aes(Age, fill = Transported)) + 
+  geom_histogram(aes(y = ..density..), bins = 80) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_continuous(breaks = seq(0, 80, by = 4))
+
+TplotF = ggplot(TransportedF, aes(Age, fill = Transported)) + 
+  geom_histogram(aes(y = ..density..), bins = 80) + scale_fill_manual(values = my_colors) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_continuous(breaks = seq(0, 80, by = 4))
+
+grid.arrange(TplotT, TplotF, top = 'Comparison of Ages (Transported or Not)')
+```
+
+**VIP**
+```{r}
+ggplot(train_x, aes(VIP, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - VIP (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.')
+```
+**CabinDeck**
+```{r}
+ggplot(train_x, aes(CabinDeck, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - CabinDeck (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.') + 
+  scale_y_continuous(breaks = seq(0, 3200, by = 200))
+
+```
+
+**CabinSide**
+```{r}
+ggplot(train_x, aes(CabinSide, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - CabinSide (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.') + 
+  scale_y_continuous(breaks = seq(0, 5000, by = 500))
+```
+
+**CabinShared**
+```{r}
+ggplot(train_x, aes(CabinShared, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - CabinShared (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.') + 
+  scale_y_continuous(breaks = seq(0, 5000, by = 500))
+```
+
+### Tables  
+Now instead of use plots to see the behavior of some variables, i'll use tables.
+
+**HomePlanet**
+```{r}
+ctable(train_x$HomePlanet, train_x$Transported,  dnn = c('HomePlanet', 'Transported'))
+```
+
+Most of the passengers of Europa and Mars went Transported and 57% of the passengers of Earth didn't Transported.
+
+**CryoSleep**
+```{r}
+ctable(train_x$CryoSleep, train_x$Transported,  dnn = c('CryoSleep', 'Transported'))
+```
+
+Almost 82% of the Cryo passengers went transported.  
+
+**Destination**
+```{r}
+ctable(train_x$Destination, train_x$Transported,  dnn = c('Destination', 'Transported'))
+```
+
+Most of the passengers were going to TRAPPIST-1e and 47% of these passengers were transported. The other two destinations had less passengers and more percentage of Transported.
+
+**VIP**
+```{r}
+ctable(train_x$VIP, train_x$Transported,  dnn = c('VIP', 'Transported'))
+```
+
+Only 199 of the passengers were VIP and 61.8% of them did not transported to another dimension. 50.6% of not VIP went transported.
+
+**CabinDeck**
+```{r}
+ctable(train_x$CabinDeck, train_x$Transported,  dnn = c('CabinDeck', 'Transported'))
+```
+
+The majority of passengers from decks A, D, E, F and T went not transported. The majority from Decks B, C and G went Transported. The biggest percentage belongs to Cabin B and the biggest number of Transported belongs to Cabin F, although as i said before, the majority of this deck were not Transported to another dimension. 
+
+**CabinSide**
+```{r}
+ctable(train_x$CabinSide, train_x$Transported,  dnn = c('CabinSide', 'Transported'))
+```
+
+While in the Side Port 54.9% of the passengers were not Transported, 55.3% of Side Starboard were Transported. 4206 passengers belongs to Side P and 4487 belongs to Side S.
+
+**CabinShared**
+```{r}
+ctable(train_x$CabinShared, train_x$Transported,  dnn = c('CabinShared', 'Transported'))
+```
+60.6% of the passengers that was sharing a cabin were Transported. And by the other hand, 44.8% of the passengers that that wasn't sharing a cabin were Transported.
+
+**CabinDeck x HomePlanet**
+```{r}
+ctable(train_x$CabinDeck, train_x$HomePlanet,  dnn = c('CabinDeck', 'HomePlanet'))
+```
+
+**CabinDeck x Destination**
+```{r}
+ctable(train_x$CabinDeck, train_x$Destination,  dnn = c('CabinDeck', 'Destination'))
+```
+
+**Destination x HomePlanet**
+```{r}
+ctable(train_x$Destination, train_x$HomePlanet,  dnn = c('Destination', 'HomePlanet'))
+```
+
+### Label the Columns
+```{r}
+str(merged)
+```
+
+**HomePlanet**
+```{r}
+merged$HomePlanet = factor(merged$HomePlanet, levels = c('Earth', 'Europa', 'Mars'),
+                           labels = c(0, 1, 2))
+```
+
+**CryoSleep**
+```{r}
+merged$CryoSleep = factor(merged$CryoSleep, levels = c('False', 'True'), labels = c(0, 1))
+```
+
+**Destination**
+```{r}
+merged$Destination = factor(merged$Destination, levels = c('TRAPPIST-1e', '55 Cancri e', 'PSO J318.5-22'),
+                            labels = c(0, 1, 2))
+```
+
+**VIP**
+```{r}
+merged$VIP = factor(merged$VIP, levels = c('False', 'True'), labels = c(0, 1))
+```
+
+**CabinDeck**
+```{r}
+merged$CabinDeck = factor(merged$CabinDeck, levels = c('G', 'F', 'E', 'D', 'C', 'B', 'A', 'T'),
+                          labels = c(0, 1, 2, 3, 4, 5, 6, 7))
+```
+
+**CabinSide**
+```{r}
+merged$CabinSide = factor(merged$CabinSide, levels = c('S', 'P'), labels = c(0, 1))
+```
+
+**CabinShared**
+```{r}
+merged$CabinShared = factor(merged$CabinShared, levels = c('FALSE', 'TRUE'), labels = c(0, 1))
+```
+
+**Transported**
+```{r}
+merged$Transported = factor(merged$Transported, levels = c('False', 'True'), labels = c(0, 1))
+```
+
+### Numeric Columns Now
+- My choice was to make only 2 variables to the numeric columns. Basically is: 0 if there was no spending in the trip and 1 if the passenger spend, no matter how much was spend.
+
+**RoomService**
+```{r}
+merged[merged$RoomService == 0, ]$RoomService = 0 
+merged[merged$RoomService >= 1, ]$RoomService = 1 
+merged$RoomService = as.factor(merged$RoomService)
+```
+
+**FoodCourt**
+```{r}
+merged[merged$FoodCourt == 0, ]$FoodCourt = 0
+merged[merged$FoodCourt >= 1, ]$FoodCourt = 1 
+merged$FoodCourt = as.factor(merged$FoodCourt)
+```
+
+**ShoppingMall**
+```{r}
+merged[merged$ShoppingMall == 0, ]$ShoppingMall = 0
+merged[merged$ShoppingMall >= 1, ]$ShoppingMall = 1 
+merged$ShoppingMall = as.factor(merged$ShoppingMall)
+```
+
+**Spa**
+```{r}
+merged[merged$Spa == 0, ]$Spa = 0
+merged[merged$Spa >= 1, ]$Spa = 1 
+merged$Spa = as.factor(merged$Spa)
+```
+
+**VRDeck**
+```{r}
+merged[merged$VRDeck == 0, ]$VRDeck = 0
+merged[merged$VRDeck >= 1, ]$VRDeck = 1 
+merged$VRDeck = as.factor(merged$VRDeck)
+```
+
+**Age**
+```{r}
+merged$AgeBand = cut(merged$Age, breaks = 4)
+merged$Age[merged$Age <= 19.8] = 0
+merged$Age[merged$Age > 19.8 & merged$Age <= 39.5] = 1
+merged$Age[merged$Age > 39.5 & merged$Age <= 59.2] = 2
+merged$Age[merged$Age > 59.2] = 3
+merged$Age = as.factor(merged$Age)
+merged$AgeBand = NULL
+```
+
+```{r}
+merged$PassengerId = NULL
+```
+
+### EDA of Former Numeric Columns
+```{r}
+train_x = merged[1:8693, ]
+test_x = merged[8694:12970, ]
+```
+
+RoomService
+```{r}
+ggplot(train_x, aes(RoomService, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - RoomService (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.')
+```
+
+FoodCourt
+```{r}
+ggplot(train_x, aes(FoodCourt, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - FoodCourt (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.')
+```
+
+ShoppingMall
+```{r}
+ggplot(train_x, aes(ShoppingMall, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - ShoppingMall (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.')
+```
+
+Spa
+```{r}
+ggplot(train_x, aes(Spa, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - Spa (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.')
+```
+
+VRDeck
+```{r}
+ggplot(train_x, aes(VRDeck, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - VRDeck (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.')
+```
+
+Age
+```{r}
+ggplot(train_x, aes(Age, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - Age (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.')
+```
+
+```{r}
+ggplot(train_x, aes(CabinShared, fill = Transported)) + 
+  geom_bar() +
+  scale_fill_manual(values = my_colors, labels = c('False', 'True')) +
+  ggtitle('Bar Plot - CabinShared (Transported or Not)') + theme(plot.title = element_text(hjust = 0.5)) +
+  ylab('Number of Obs.') + 
+  scale_y_continuous(breaks = seq(0, 5000, by = 500)) +
+  facet_grid(rows = vars(HomePlanet), cols = vars(Spa))
+```
+
+- Plot above: 
+Left side = Passengers who didn't went to Spa; and right side = Passengers who went to Spa. We clearly see that passengers that paid a service in the ship did more chance to survive. If we plot ShoppingMall or whatever other service, we'll see almost the same plot.  
+Columns  
+0 = Cabin not shared.  
+1 = Cabin shared.  
+Rows  
+0 = Home Planet Earth  
+1 = Home Planet Europa  
+2 = Home Planet Mars  
+
+### Tables of Former Numeric Columns
+**RoomService**
+```{r}
+ctable(train_x$RoomService, train_x$Transported,  dnn = c('RoomService', 'Transported'))
+```
+While 62.8% of the passengers that didn't had any spend in the trip were Transported, 37.2% weren't. The opposite happens when the passenger spend some amount. 74% of the passengers with some amount of spending were not Transported, and 26% of the passenger that spend any amount were Transported. The premise is the same with the other services, but of course, with different values.  
+
+**FoodCourt**
+```{r}
+ctable(train_x$FoodCourt, train_x$Transported,  dnn = c('FoodCourt', 'Transported'))
+```
+
+**ShoppingMall**
+```{r}
+ctable(train_x$ShoppingMall, train_x$Transported,  dnn = c('ShoppingMall', 'Transported'))
+
+```
+
+**Spa**
+```{r}
+ctable(train_x$Spa, train_x$Transported,  dnn = c('Spa', 'Transported'))
+```
+
+**VRDeck**
+```{r}
+ctable(train_x$VRDeck, train_x$Transported,  dnn = c('VRDeck', 'Transported'))
+```
+
+**Age**
+```{r}
+ctable(train_x$Age, train_x$Transported,  dnn = c('Age', 'Transported'))
+```
+
+## Make the Predictions
+Setting a seed first.
+```{r}
+set.seed(10)
+```
+
+### Split
+```{r}
+sample = sample.split(train_x$Transported, SplitRatio = 0.7)
+train_X = subset(train_x, sample == T)
+test_X = subset(train_x, sample == F)
+```
+
+### Logistic Regression
+```{r}
+log.fit = glm(Transported~., data = train_X, family = 'binomial')
+prob.log = predict(log.fit, type = 'response', newdata = test_X)
+pred.log = ifelse(prob.log > 0.5, 1, 0) %>% as.factor()
+matrix.log = table(test_X$Transported, pred.log)
+matrix.log
+```
+
+**Accuracy**
+```{r}
+acc.log = (matrix.log[1, 1] + matrix.log[2, 2]) / (matrix.log[1, 1] + matrix.log[1, 2] + matrix.log[2, 1] + matrix.log[2, 2])
+acc.log
+```
+
+### SVM - Linear Kernel
+```{r}
+svm.fit = svm(Transported ~ ., data = train_X, type = 'C-classification', kernel = 'linear')
+pred.svm = predict(svm.fit, newdata = test_X)
+matrix.svm = table(test_X$Transported, pred.svm)
+matrix.svm
+```
+
+**Accuracy**
+```{r}
+acc.svm = (matrix.svm[1, 1] + matrix.svm[2, 2]) / (matrix.svm[1, 1] + matrix.svm[1, 2] + matrix.svm[2, 1] + matrix.svm[2, 2])
+acc.svm
+```
+
+### SVM - Radial Kernel
+```{r}
+svm.fit2 = svm(Transported ~ ., data = train_X, type = 'C-classification', kernel = 'radial')
+pred.svm2 = predict(svm.fit2, newdata = test_X)
+matrix.svm2 = table(test_X$Transported, pred.svm2)
+matrix.svm2
+```
+
+**Accuracy**
+```{r}
+acc.svm2 = (matrix.svm2[1, 1] + matrix.svm2[2, 2]) / (matrix.svm2[1, 1] + matrix.svm2[1, 2] + matrix.svm2[2, 1] + matrix.svm2[2, 2])
+acc.svm2
+```
+
+### Naive Bayes
+```{r}
+nb.fit = naiveBayes(x = train_X[, -11],
+                    y = train_X$Transported)
+pred.nb = predict(nb.fit, newdata = test_X)
+matrix.nb = table(test_X$Transported, pred.nb)
+matrix.nb
+```
+
+**Accuracy**
+```{r}
+acc.nb = (matrix.nb[1, 1] + matrix.nb[2, 2]) / (matrix.nb[1, 1] + matrix.nb[1, 2] + matrix.nb[2, 1] + matrix.nb[2, 2])
+acc.nb
+```
+
+### K-NN
+```{r}
+knn.fit = knn(train = train_X[, -11],
+              test = test_X[, -11],
+              cl = train_X[, 11],
+              k = 5)
+matrix.knn = table(test_X$Transported, knn.fit)
+matrix.knn
+```
+
+**Accuracy**
+```{r}
+acc.knn = (matrix.knn[1, 1] + matrix.knn[2, 2]) / (matrix.knn[1, 1] + matrix.knn[1, 2] + matrix.knn[2, 1] + matrix.knn[2, 2])
+acc.knn
+```
+
+### Decision Tree
+```{r}
+dt.fit = rpart(Transported ~., data = train_X)
+pred.dt = predict(dt.fit, newdata = test_X, type = 'class') %>% as.factor()
+matrix.dt = table(test_X$Transported, pred.dt)
+matrix.dt
+```
+
+**Accuracy**
+```{r}
+acc.dt = (matrix.dt[1, 1] + matrix.dt[2, 2]) / (matrix.dt[1, 1] + matrix.dt[1, 2] + matrix.dt[2, 1] + matrix.dt[2, 2])
+acc.dt
+```
+
+### Random Forest
+```{r}
+rf.fit = randomForest(x = train_X[, -11], y = train_X$Transported, ntree = 300)
+pred.rf = predict(rf.fit, newdata = test_X)
+matrix.rf = table(test_X$Transported, pred.rf)
+matrix.rf
+```
+
+**Accuracy**
+```{r}
+acc.rf = (matrix.rf[1, 1] + matrix.rf[2, 2]) / (matrix.rf[1, 1] + matrix.rf[1, 2] + matrix.rf[2, 1] + matrix.rf[2, 2])
+acc.rf
+```
+
+### DataFrame 
+```{r}
+Accuracy = data.frame(Model = c('Logistic Regression', 'SVM - Linear', 'SVM - Radial', 'Naive Bayes', 'K-NN', 'Decision Tree', 'Random Forest'), 
+                      Accuracy = c(acc.log, acc.svm, acc.svm2, acc.nb, acc.knn, acc.rf, acc.dt))
+
+Accuracy
+```
+
+### Deep Learning - ANN
+```{r, warning=FALSE, message=FALSE}
+h2o.init(nthreads = -1)
+
+ann.fit = h2o.deeplearning(y = 'Transported', training_frame = as.h2o(train_X),
+                              activation = 'TanhWithDropout', hidden = c(7, 7),
+                              epochs = 5, train_samples_per_iteration = -2)
+
+
+prob.ann = h2o.predict(ann.fit, newdata = as.h2o(test_X))
+pred.ann = prob.ann$predict %>% as.vector
+matrix.ann = table(test_X$Transported, pred.ann)
+matrix.ann
+
+acc.ann = (matrix.ann[1, 1] + matrix.ann[2, 2]) / (matrix.ann[1, 1] + matrix.ann[1, 2] + matrix.ann[2, 1] + matrix.ann[2, 2])
+acc.ann
+```
+
+### K-Fold Cross Validation
+I'll make K-Fold CV only for the SVM.
+```{r}
+folds = createFolds(train_X$Transported, k = 10)
+cv = lapply(folds, function(x) {
+  train_fold = train_X[-x, ]
+  test_fold = train_X[x, ]
+  svm.fit1 = svm(Transported ~., data = train_fold, 
+                type = "C-classification", 
+                kernel = "radial")
+  svm_pred1 = predict(svm.fit1, newdata = test_fold)
+  svm_Matrix1 = (confusionMatrix(svm_pred1, test_fold$Transported)$overall['Accuracy'])
+})
+
+mean(as.numeric(cv))
+```
+
+```{r}
+h2o.shutdown()
+```
+
